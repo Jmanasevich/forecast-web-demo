@@ -1,104 +1,116 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from io import BytesIO
 import base64
+from fpdf import FPDF
+import matplotlib.pyplot as plt
+import tempfile
 
 st.set_page_config(page_title="Forecast & Inventario", layout="wide")
 
-PASSWORD = "demo123"
+PASSWORD = "alb2025"
 
-def check_password():
-    def password_entered():
-        if st.session_state["password"] == PASSWORD:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
+LOGO_PATH = "logo 2.jpg"  # Logo personalizado de ALB Consultores
 
-    if "password_correct" not in st.session_state:
-        st.text_input("Contraseña", type="password", on_change=password_entered, key="password")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.text_input("Contraseña", type="password", on_change=password_entered, key="password")
-        st.error("Contraseña incorrecta")
-        return False
-    else:
-        return True
+class PDFConLogo(FPDF):
+    def header(self):
+        self.image(LOGO_PATH, 10, 8, 33)  # logo empresa
+        self.set_font('Arial', 'B', 12)
+        self.cell(0, 10, 'Reporte Inteligente de Inventario', border=False, ln=1, align='C')
+        self.ln(10)
 
-if not check_password():
-    st.stop()
+st.image(LOGO_PATH, width=100)
 
-st.title("Forecast y Planificación de Inventario por SKU")
-archivo = st.file_uploader("Carga tu archivo Excel o CSV con los datos históricos", type=["csv", "xlsx"])
+# Entrenamiento seguro filtrando NaNs en ventas
+def entrenar_modelo(df):
+    df_entrenamiento = df[df["Ventas"].notna()]
+    X = df_entrenamiento[["Precio", "Promocion", "Dia_semana", "Es_feriado"]]
+    y = df_entrenamiento["Ventas"]
 
-if archivo:
-    if archivo.name.endswith(".csv"):
-        df = pd.read_csv(archivo, parse_dates=['Fecha'])
-    else:
-        df = pd.read_excel(archivo, parse_dates=['Fecha'])
+    modelo = RandomForestRegressor()
+    modelo.fit(X, y)
+    return modelo
 
-    st.success("Archivo cargado con éxito")
-
-    columnas_necesarias = ["Fecha", "SKU", "Ventas", "Precio", "Promocion", "Dia_semana", "Es_feriado"]
-    if not all(col in df.columns for col in columnas_necesarias):
-        st.error(f"Tu archivo debe tener las columnas: {', '.join(columnas_necesarias)}")
+# Validación previa a concatenar resultados
+def concatenar_resultados(resultados):
+    if not resultados:
+        st.error("No se pudo generar forecast para ningún SKU. Revisa que tus datos tengan suficientes datos históricos de ventas.")
         st.stop()
+    return pd.concat(resultados).reset_index(drop=True)
 
-    df.sort_values(["SKU", "Fecha"], inplace=True)
-    df["Ventas_t-1"] = df.groupby("SKU")["Ventas"].shift(1)
-    df["Ventas_t-2"] = df.groupby("SKU")["Ventas"].shift(2)
-    df.dropna(inplace=True)
+def generar_excel():
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        if 'df_forecast' not in globals() or df_forecast.empty:
+            st.error("No se pudo generar forecast para ningún SKU. Revisa que tus datos tengan valores en la columna 'Ventas'.")
+            st.stop()
 
-    resultados = []
-    dias_cobertura = 7
-    factor_seguridad = 1.2
+        df_forecast.to_excel(writer, sheet_name='Forecast', index=False)
+        df_plan.to_excel(writer, sheet_name='Planificacion', index=False)
 
-    for sku in df["SKU"].unique():
-        data = df[df["SKU"] == sku].copy()
-        X = data[["Ventas_t-1", "Ventas_t-2", "Precio", "Promocion", "Dia_semana", "Es_feriado"]]
-        y = data["Ventas"]
+        workbook = writer.book
+        resumen_hoja = workbook.add_worksheet("Resumen_Graficos")
+        resumen_hoja.write(0, 0, "Gráficos de Forecast por SKU")
 
-        split = int(len(data) * 0.8)
-        X_train, X_test = X.iloc[:split], X.iloc[split:]
-        y_train, y_test = y.iloc[:split], y.iloc[split:]
+        row_offset = 2
+        col_offset = 0
 
-        modelo = RandomForestRegressor(n_estimators=100, random_state=42)
-        modelo.fit(X_train, y_train)
+        for idx, sku in enumerate(df_forecast["SKU"].unique()):
+            df_plot = df_forecast[df_forecast["SKU"] == sku].copy()
 
-        pred = modelo.predict(X_test)
-        forecast = data.iloc[split:].copy()
-        forecast["Prediccion"] = pred
-        resultados.append(forecast.tail(dias_cobertura))
+            # Corte basado en última fecha con venta real
+            fecha_corte = df_plot.loc[df_plot['Ventas'].notna(), 'Fecha'].max()
+            df_plot['Ventas'] = df_plot.apply(lambda row: row['Ventas'] if row['Fecha'] <= fecha_corte else None, axis=1)
+            df_plot['Prediccion'] = df_plot.apply(lambda row: row['Prediccion'] if row['Fecha'] > fecha_corte else None, axis=1)
 
-    df_forecast = pd.concat(resultados).reset_index(drop=True)
+            hoja = workbook.add_worksheet(f"Graf_{sku[:25]}")
+            chart = workbook.add_chart({'type': 'line'})
 
-    demanda = df_forecast.groupby("SKU")["Prediccion"].sum().rename("Demanda_7_dias")
-    stock_objetivo = demanda * factor_seguridad
-    stock_actual = pd.Series(np.random.randint(100, 200, size=len(stock_objetivo)), index=stock_objetivo.index)
-    compra_sugerida = (stock_objetivo - stock_actual).clip(lower=0).round()
+            hoja.write_column(0, 0, ['Fecha'] + list(df_plot['Fecha'].dt.strftime('%Y-%m-%d')))
+            hoja.write_column(0, 1, ['Ventas'] + [None if pd.isna(v) else v for v in df_plot['Ventas']])
+            hoja.write_column(0, 2, ['Forecast'] + [None if pd.isna(f) else f for f in df_plot['Prediccion']])
 
-    df_plan = pd.DataFrame({
-        "SKU": demanda.index,
-        "Demanda_7_dias": demanda.values,
-        "Stock_objetivo": stock_objetivo.values,
-        "Stock_actual": stock_actual.values,
-        "Compra_sugerida": compra_sugerida.values
-    })
+            n = len(df_plot)
+            chart.add_series({
+                'name': 'Ventas reales',
+                'categories': [f'Graf_{sku[:25]}', 1, 0, n, 0],
+                'values':     [f'Graf_{sku[:25]}', 1, 1, n, 1],
+                'gap': True,
+                'connect_gaps': False
+            })
+            chart.add_series({
+                'name': 'Forecast ajustado',
+                'categories': [f'Graf_{sku[:25]}', 1, 0, n, 0],
+                'values':     [f'Graf_{sku[:25]}', 1, 2, n, 2],
+                'gap': True,
+                'connect_gaps': False
+            })
+            chart.set_title({'name': f"{sku}"})
+            chart.set_x_axis({'name': 'Fecha'})
+            chart.set_y_axis({'name': 'Unidades'})
+            hoja.insert_chart('E2', chart)
 
-    st.subheader("Resumen de Planificación")
-    st.dataframe(df_plan, use_container_width=True)
+            fechas_forecast = df_plot.loc[df_plot['Prediccion'].notna(), 'Fecha']
+            if not fechas_forecast.empty:
+                fecha_ini = fechas_forecast.min().strftime('%Y-%m-%d')
+                fecha_fin = fechas_forecast.max().strftime('%Y-%m-%d')
+            else:
+                fecha_ini = fecha_fin = "Sin datos de forecast"
 
-    def generar_descarga(df):
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df_forecast.to_excel(writer, sheet_name='Forecast', index=False)
-            df_plan.to_excel(writer, sheet_name='Planificacion', index=False)
-        output.seek(0)
-        b64 = base64.b64encode(output.read()).decode()
-        return f'<a href="data:application/octet-stream;base64,{b64}" download="forecast_resultado.xlsx">Descargar Excel</a>'
+            comentario = f"SKU: {sku} | Forecast desde {fecha_ini} hasta {fecha_fin}"
 
-    st.markdown(generar_descarga(df_plan), unsafe_allow_html=True)
-    st.success("Forecast y planificación generados exitosamente")
+            resumen_hoja.insert_chart(row_offset, col_offset, chart, {'x_scale': 0.6, 'y_scale': 0.6})
+            resumen_hoja.write(row_offset + 14, col_offset, comentario)
+            resumen_hoja.write(row_offset + 15, col_offset, f"Revisar tendencia y compras sugeridas")
+            col_offset += 8
+            if col_offset > 15:
+                col_offset = 0
+                row_offset += 18
+
+    output.seek(0)
+    b64 = base64.b64encode(output.read()).decode()
+    enlace = f'<a href="data:application/octet-stream;base64,{b64}" download="reporte_inteligente_forecast.xlsx">Descargar reporte de forecast e inventario en Excel</a>'
+    st.markdown(enlace, unsafe_allow_html=True)
+    return enlace
